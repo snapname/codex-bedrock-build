@@ -12,54 +12,35 @@ jobs:
     runs-on: macos-15-intel
 
     steps:
-      # ------------------------------------------------------------
-      # 1. Checkout our repository
-      # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # 2. Checkout official OpenAI Codex source
-      # ------------------------------------------------------------
       - name: Clone OpenAI Codex
         run: |
           git clone --depth 1 --branch rust-v0.154.0 \
             https://github.com/openai/codex.git \
             codex-source
 
-      # ------------------------------------------------------------
-      # 3. Install Rust
-      # ------------------------------------------------------------
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: rustfmt, clippy
 
-      # ------------------------------------------------------------
-      # 4. Show build environment
-      # ------------------------------------------------------------
       - name: Show environment
         run: |
           echo "=== System ==="
           sw_vers
-
           echo "=== Architecture ==="
           uname -m
-
           echo "=== Rust ==="
           rustc --version
           cargo --version
-
           echo "=== CPU ==="
           sysctl -n hw.ncpu
-
           echo "=== Memory ==="
           sysctl -n hw.memsize
 
-      # ------------------------------------------------------------
-      # 5. Patch Bedrock namespace compatibility
-      # ------------------------------------------------------------
       - name: Patch Bedrock namespace tools
         working-directory: codex-source
         shell: bash
@@ -68,17 +49,13 @@ jobs:
 
           FILE="codex-rs/model-provider/src/amazon_bedrock/mod.rs"
 
-          echo "Checking:"
-          echo "$FILE"
-
           if [ ! -f "$FILE" ]; then
-            echo "ERROR: Bedrock provider source file not found."
+            echo "ERROR: File not found: $FILE"
             exit 1
           fi
 
-          echo
           echo "=== Before patch ==="
-          grep -n -A12 -B5 "fn capabilities" "$FILE" || true
+          grep -n "namespace_tools:" "$FILE"
 
           python3 - "$FILE" <<'PY'
           from pathlib import Path
@@ -88,22 +65,18 @@ jobs:
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          # Only patch the REAL AmazonBedrockModelProvider
-          # capabilities() implementation.
-          #
-          # Do NOT modify namespace_tools values in tests.
-
           pattern = (
-              r'(impl ModelProvider for AmazonBedrockModelProvider\s*\{'
-              r'.*?'
-              r'fn capabilities\(&self\) -> ProviderCapabilities\s*\{'
-              r'\s*ProviderCapabilities\s*\{\s*'
-              r')namespace_tools:\s*true,'
+              r'(impl\s+ModelProvider\s+for\s+AmazonBedrockModelProvider'
+              r'\s*\{.*?'
+              r'fn\s+capabilities\(&self\)\s*->\s*ProviderCapabilities'
+              r'\s*\{.*?'
+              r'ProviderCapabilities\s*\{.*?'
+              r')namespace_tools\s*:\s*true\s*,'
           )
 
           replacement = r'\1namespace_tools: false,'
 
-          new_text, count = re.sub(
+          new_text, count = re.subn(
               pattern,
               replacement,
               text,
@@ -112,28 +85,63 @@ jobs:
           )
 
           if count != 1:
-              print(
-                  "ERROR: Could not find the real "
-                  "Bedrock capabilities() implementation."
-              )
+              print("ERROR: Failed to patch Bedrock capabilities().")
+              print(f"Matches found: {count}")
               sys.exit(1)
 
           path.write_text(new_text)
 
-          print("SUCCESS: Bedrock namespace_tools changed to false.")
+          print("SUCCESS: Bedrock namespace_tools disabled.")
           PY
 
           echo
           echo "=== After patch ==="
-          grep -n -A12 -B5 "fn capabilities" "$FILE" || true
-
-          echo
-          echo "=== All namespace_tools occurrences ==="
           grep -n "namespace_tools:" "$FILE"
 
-      # ------------------------------------------------------------
-      # 6. Build Codex
-      # ------------------------------------------------------------
+      - name: Verify patch
+        working-directory: codex-source
+        run: |
+          set -euo pipefail
+
+          FILE="codex-rs/model-provider/src/amazon_bedrock/mod.rs"
+
+          echo "=== Bedrock capabilities() ==="
+
+          python3 - "$FILE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          text = Path(sys.argv[1]).read_text()
+
+          start = text.find(
+              "impl ModelProvider for AmazonBedrockModelProvider"
+          )
+
+          if start == -1:
+              raise SystemExit("Bedrock provider implementation not found.")
+
+          end = text.find(
+              "#[cfg(test)]",
+              start
+          )
+
+          if end == -1:
+              end = len(text)
+
+          block = text[start:end]
+
+          print(block)
+
+          if "namespace_tools: false" not in block:
+              raise SystemExit(
+                  "ERROR: namespace_tools: false not found "
+                  "in production Bedrock capabilities()."
+              )
+
+          print("SUCCESS: Patch verified.")
+
+          PY
+
       - name: Build Codex
         working-directory: codex-source/codex-rs
         env:
@@ -141,9 +149,6 @@ jobs:
         run: |
           cargo build --locked -p codex-cli --bin codex
 
-      # ------------------------------------------------------------
-      # 7. Verify binary
-      # ------------------------------------------------------------
       - name: Verify Codex binary
         working-directory: codex-source/codex-rs
         run: |
@@ -160,9 +165,6 @@ jobs:
           echo "=== Codex version ==="
           ./target/debug/codex --version
 
-      # ------------------------------------------------------------
-      # 8. Package
-      # ------------------------------------------------------------
       - name: Package Codex
         working-directory: codex-source/codex-rs
         run: |
@@ -170,31 +172,24 @@ jobs:
 
           mkdir -p ../../codex-artifact
 
-          cp target/debug/codex \
-            ../../codex-artifact/codex
-
-          chmod +x \
-            ../../codex-artifact/codex
+          cp target/debug/codex ../../codex-artifact/codex
+          chmod +x ../../codex-artifact/codex
 
           cat > ../../codex-artifact/README.txt <<'EOF'
           Custom Codex build for Intel macOS.
 
-          Purpose:
-          - AWS Bedrock Mantle compatibility
-          - namespace_tools disabled for Bedrock
-          - Built from OpenAI Codex rust-v0.154.0
+          AWS Bedrock Mantle compatibility patch:
+          namespace_tools = false
+
+          Source:
+          OpenAI Codex rust-v0.154.0
 
           Target:
-          - macOS Intel x86_64
+          macOS Intel x86_64
 
-          Model is NOT embedded in this binary.
-
-          Configure the model separately in Codex config.toml.
+          The model is configured separately in config.toml.
           EOF
 
-      # ------------------------------------------------------------
-      # 9. Upload binary
-      # ------------------------------------------------------------
       - name: Upload Codex artifact
         uses: actions/upload-artifact@v4
         with:
