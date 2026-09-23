@@ -58,15 +58,7 @@ jobs:
           sysctl -n hw.memsize
 
       # ------------------------------------------------------------
-      # 5. Apply Bedrock namespace compatibility patch
-      #
-      # Bedrock Mantle does not accept:
-      #
-      #   {"type":"namespace", ...}
-      #
-      # It accepts function / mcp.
-      #
-      # The Codex Bedrock issue documents this exact problem.
+      # 5. Patch Bedrock namespace compatibility
       # ------------------------------------------------------------
       - name: Patch Bedrock namespace tools
         working-directory: codex-source
@@ -85,42 +77,58 @@ jobs:
           fi
 
           echo
-          echo "Before patch:"
-          grep -n -A10 -B5 "fn capabilities" "$FILE" || true
+          echo "=== Before patch ==="
+          grep -n -A12 -B5 "fn capabilities" "$FILE" || true
 
           python3 - "$FILE" <<'PY'
           from pathlib import Path
+          import re
           import sys
 
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          old = "namespace_tools: true,"
-          new = "namespace_tools: false,"
+          # Only patch the REAL AmazonBedrockModelProvider
+          # capabilities() implementation.
+          #
+          # Do NOT modify namespace_tools values in tests.
 
-          count = text.count(old)
+          pattern = (
+              r'(impl ModelProvider for AmazonBedrockModelProvider\s*\{'
+              r'.*?'
+              r'fn capabilities\(&self\) -> ProviderCapabilities\s*\{'
+              r'\s*ProviderCapabilities\s*\{\s*'
+              r')namespace_tools:\s*true,'
+          )
 
-          if count == 0:
-              print("ERROR: namespace_tools: true was not found.")
+          replacement = r'\1namespace_tools: false,'
+
+          new_text, count = re.sub(
+              pattern,
+              replacement,
+              text,
+              count=1,
+              flags=re.DOTALL,
+          )
+
+          if count != 1:
+              print(
+                  "ERROR: Could not find the real "
+                  "Bedrock capabilities() implementation."
+              )
               sys.exit(1)
 
-          if count > 1:
-              print(f"ERROR: Found {count} occurrences.")
-              print("Refusing to modify automatically.")
-              sys.exit(1)
+          path.write_text(new_text)
 
-          text = text.replace(old, new, 1)
-          path.write_text(text)
-
-          print("Patch applied successfully.")
+          print("SUCCESS: Bedrock namespace_tools changed to false.")
           PY
 
           echo
-          echo "After patch:"
-          grep -n -A10 -B5 "fn capabilities" "$FILE" || true
+          echo "=== After patch ==="
+          grep -n -A12 -B5 "fn capabilities" "$FILE" || true
 
           echo
-          echo "Confirmed:"
+          echo "=== All namespace_tools occurrences ==="
           grep -n "namespace_tools:" "$FILE"
 
       # ------------------------------------------------------------
@@ -134,7 +142,7 @@ jobs:
           cargo build --locked -p codex-cli --bin codex
 
       # ------------------------------------------------------------
-      # 7. Verify the resulting binary
+      # 7. Verify binary
       # ------------------------------------------------------------
       - name: Verify Codex binary
         working-directory: codex-source/codex-rs
@@ -153,7 +161,7 @@ jobs:
           ./target/debug/codex --version
 
       # ------------------------------------------------------------
-      # 8. Package artifact
+      # 8. Package
       # ------------------------------------------------------------
       - name: Package Codex
         working-directory: codex-source/codex-rs
@@ -182,14 +190,10 @@ jobs:
           Model is NOT embedded in this binary.
 
           Configure the model separately in Codex config.toml.
-          Example:
-
-          model = "openai.gpt-6-astra"
-          model_provider = "bedrock"
           EOF
 
       # ------------------------------------------------------------
-      # 9. Upload the compiled binary
+      # 9. Upload binary
       # ------------------------------------------------------------
       - name: Upload Codex artifact
         uses: actions/upload-artifact@v4
