@@ -1,189 +1,46 @@
-name: Build Codex for Intel macOS
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    name: Build Codex x86_64 macOS
-    runs-on: macos-15-intel
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Clone OpenAI Codex
-        run: |
-          git clone --depth 1 --branch rust-v0.154.0 \
-            https://github.com/openai/codex.git \
-            codex-source
-
-      - name: Install Rust 1.95.0
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.95.0
-          components: rustfmt, clippy, rust-src
-
-      - name: Show environment
-        run: |
-          echo "=== System ==="
-          sw_vers
-
-          echo "=== Architecture ==="
-          uname -m
-
-          echo "=== Rust ==="
-          rustc --version
-          cargo --version
-
-          echo "=== CPU ==="
-          sysctl -n hw.ncpu
-
       - name: Patch Bedrock namespace tools
         working-directory: codex-source
         shell: bash
         run: |
           set -euo pipefail
 
-          FILE="codex-rs/model-provider/src/amazon_bedrock/mod.rs"
-
-          if [ ! -f "$FILE" ]; then
-            echo "ERROR: File not found: $FILE"
-            exit 1
-          fi
+          FILE="codex-rs/model-provider/src/provider.rs"
 
           python3 - "$FILE" <<'PY'
           from pathlib import Path
-          import re
           import sys
 
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          pattern = (
-              r'(impl\s+ModelProvider\s+for\s+AmazonBedrockModelProvider'
-              r'\s*\{.*?'
-              r'fn\s+capabilities\(&self\)\s*->\s*ProviderCapabilities'
-              r'\s*\{.*?'
-              r'ProviderCapabilities\s*\{.*?'
-              r')namespace_tools\s*:\s*true\s*,'
-          )
+          old = """        ProviderCapabilities {
+            remote_compaction,
+            ..ProviderCapabilities::default()
+        }"""
 
-          new_text, count = re.subn(
-              pattern,
-              r'\1namespace_tools: false,',
-              text,
-              count=1,
-              flags=re.DOTALL,
-          )
+          new = """        ProviderCapabilities {
+            namespace_tools: false,
+            image_generation: false,
+            web_search: false,
+            external_web_access: false,
+            remote_compaction,
+        }"""
 
-          if count != 1:
+          if old not in text:
               raise SystemExit(
-                  f"Patch failed: expected 1 match, found {count}"
+                  "ERROR: Could not find ConfiguredModelProvider capabilities block."
               )
 
-          path.write_text(new_text)
+          text = text.replace(old, new, 1)
 
-          print("SUCCESS: namespace_tools = false")
+          path.write_text(text)
+
+          print("SUCCESS: ConfiguredModelProvider namespace_tools disabled.")
           PY
 
           echo
-          echo "=== namespace_tools ==="
-          grep -n "namespace_tools:" "$FILE"
+          echo "=== Patched ConfiguredModelProvider ==="
 
-      - name: Verify patch
-        working-directory: codex-source/codex-rs
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("model-provider/src/amazon_bedrock/mod.rs")
-          text = path.read_text()
-
-          start = text.find(
-              "impl ModelProvider for AmazonBedrockModelProvider"
-          )
-
-          if start == -1:
-              raise SystemExit(
-                  "ERROR: Bedrock provider implementation not found."
-              )
-
-          end = text.find("#[cfg(test)]", start)
-
-          if end == -1:
-              end = len(text)
-
-          block = text[start:end]
-
-          if "namespace_tools: false" not in block:
-              raise SystemExit(
-                  "ERROR: namespace_tools was not patched."
-              )
-
-          print("SUCCESS: Bedrock patch verified.")
-          PY
-
-      - name: Build Codex
-        working-directory: codex-source/codex-rs
-        env:
-          CARGO_TERM_COLOR: always
-        run: |
-          set -euo pipefail
-
-          cargo +1.95.0 build -p codex-cli --bin codex
-
-      - name: Verify Codex binary
-        working-directory: codex-source/codex-rs
-        run: |
-          set -euo pipefail
-
-          echo "=== File type ==="
-          file target/debug/codex
-
-          echo
-          echo "=== Architecture ==="
-          lipo -info target/debug/codex || true
-
-          echo
-          echo "=== Codex version ==="
-          ./target/debug/codex --version
-
-      - name: Package Codex
-        working-directory: codex-source/codex-rs
-        run: |
-          set -euo pipefail
-
-          mkdir -p ../../codex-artifact
-
-          cp target/debug/codex ../../codex-artifact/codex
-          chmod +x ../../codex-artifact/codex
-
-          cat > ../../codex-artifact/README.txt <<'EOF'
-          Custom Codex build for Intel macOS.
-
-          OpenAI Codex:
-          rust-v0.154.0
-
-          Rust:
-          1.95.0
-
-          AWS Bedrock Mantle compatibility:
-          namespace_tools = false
-
-          Target:
-          macOS Intel x86_64
-          EOF
-
-      - name: Upload Codex artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: codex-intel-macos
-          path: codex-artifact/
-          if-no-files-found: error
-          retention-days: 7
+          grep -n -A10 -B3 \
+            "fn capabilities(&self) -> ProviderCapabilities" \
+            "$FILE"
