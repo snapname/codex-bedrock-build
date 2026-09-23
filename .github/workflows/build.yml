@@ -55,19 +55,16 @@ jobs:
 
       - name: Patch Bedrock namespace tools
         working-directory: codex-source
-        shell: bash
         run: |
           set -euo pipefail
 
           FILE="codex-rs/model-provider/src/provider.rs"
 
           if [ ! -f "$FILE" ]; then
-            echo "ERROR: File not found: $FILE"
+            echo "ERROR: File not found:"
+            echo "$FILE"
             exit 1
           fi
-
-          echo "=== Before patch ==="
-          sed -n '316,335p' "$FILE"
 
           python3 - "$FILE" <<'PY'
           from pathlib import Path
@@ -76,46 +73,76 @@ jobs:
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          old = """        ProviderCapabilities {
-            remote_compaction,
-            ..ProviderCapabilities::default()
-        }"""
+          impl_start = text.find(
+              "impl ModelProvider for ConfiguredModelProvider"
+          )
 
-          new = """        ProviderCapabilities {
-            namespace_tools: false,
-            remote_compaction,
-            ..ProviderCapabilities::default()
-        }"""
-
-          if old not in text:
-              print("ERROR: Target ProviderCapabilities block not found.")
-              print()
-              print("Actual source around ConfiguredModelProvider:")
-              start = text.find(
-                  "impl ModelProvider for ConfiguredModelProvider"
+          if impl_start == -1:
+              raise SystemExit(
+                  "ERROR: ConfiguredModelProvider not found."
               )
-              if start == -1:
-                  raise SystemExit(
-                      "ERROR: ConfiguredModelProvider not found."
-                  )
 
-              print(text[start:start + 1200])
-              sys.exit(1)
+          cap_start = text.find(
+              "fn capabilities(&self) -> ProviderCapabilities",
+              impl_start,
+          )
 
-          text = text.replace(old, new, 1)
-          path.write_text(text)
+          if cap_start == -1:
+              raise SystemExit(
+                  "ERROR: capabilities() not found."
+              )
 
-          print()
-          print("SUCCESS: namespace_tools = false")
+          provider_block_start = text.find(
+              "ProviderCapabilities {",
+              cap_start,
+          )
+
+          if provider_block_start == -1:
+              raise SystemExit(
+                  "ERROR: ProviderCapabilities block not found."
+              )
+
+          remote_pos = text.find(
+              "remote_compaction,",
+              provider_block_start,
+          )
+
+          if remote_pos == -1:
+              raise SystemExit(
+                  "ERROR: remote_compaction not found."
+              )
+
+          namespace_line = "            namespace_tools: false,\n"
+
+          if text.rfind(
+              "namespace_tools: false,",
+              cap_start,
+              remote_pos,
+          ) != -1:
+              print("namespace_tools already patched.")
+          else:
+              text = (
+                  text[:remote_pos]
+                  + namespace_line
+                  + text[remote_pos:]
+              )
+
+              path.write_text(text)
+
+              print(
+                  "SUCCESS: namespace_tools = false added."
+              )
           PY
 
           echo
-          echo "=== After patch ==="
-          sed -n '316,337p' "$FILE"
+          echo "=== Patched capabilities() ==="
+
+          sed -n \
+            '/impl ModelProvider for ConfiguredModelProvider/,/fn approval_review_preferred_model/p' \
+            "$FILE"
 
       - name: Verify Bedrock patch
         working-directory: codex-source
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -127,44 +154,44 @@ jobs:
 
           text = Path(sys.argv[1]).read_text()
 
-          provider_start = text.find(
+          impl_start = text.find(
               "impl ModelProvider for ConfiguredModelProvider"
           )
 
-          if provider_start == -1:
+          if impl_start == -1:
               raise SystemExit(
                   "ERROR: ConfiguredModelProvider not found."
               )
 
-          capabilities_start = text.find(
+          cap_start = text.find(
               "fn capabilities(&self) -> ProviderCapabilities",
-              provider_start,
+              impl_start,
           )
 
-          if capabilities_start == -1:
+          if cap_start == -1:
               raise SystemExit(
                   "ERROR: capabilities() not found."
               )
 
           next_fn = text.find(
-              "fn approval_review_preferred_model",
-              capabilities_start,
+              "\n    fn ",
+              cap_start + 10,
           )
 
           if next_fn == -1:
-              raise SystemExit(
-                  "ERROR: End of capabilities() not found."
-              )
+              next_fn = len(text)
 
-          block = text[capabilities_start:next_fn]
+          block = text[cap_start:next_fn]
 
           if "namespace_tools: false" not in block:
               print(block)
               raise SystemExit(
-                  "ERROR: namespace_tools was not patched."
+                  "ERROR: namespace_tools = false was not found."
               )
 
-          print("SUCCESS: Bedrock namespace patch verified.")
+          print(
+              "SUCCESS: namespace_tools = false verified."
+          )
           PY
 
       - name: Build Codex
@@ -178,7 +205,6 @@ jobs:
 
       - name: Verify Codex binary
         working-directory: codex-source/codex-rs
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -195,7 +221,6 @@ jobs:
 
       - name: Package Codex
         working-directory: codex-source/codex-rs
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -216,7 +241,7 @@ jobs:
           Rust:
           1.95.0
 
-          Bedrock Mantle compatibility:
+          Bedrock Mantle compatibility patch:
           namespace_tools = false
 
           Target:
