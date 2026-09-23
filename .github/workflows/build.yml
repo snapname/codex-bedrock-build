@@ -1,4 +1,122 @@
-      - name: Patch Bedrock namespace tools
+name: Build Codex for Intel macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Codex x86_64 macOS
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone OpenAI Codex
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --branch rust-v0.154.0 \
+            https://github.com/openai/codex.git \
+            codex-source
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy, rust-src
+
+      - name: Show environment
+        run: |
+          set -euo pipefail
+
+          echo "=== System ==="
+          sw_vers
+
+          echo
+          echo "=== Architecture ==="
+          uname -m
+
+          echo
+          echo "=== Rust ==="
+          rustc --version
+          cargo --version
+
+          echo
+          echo "=== CPU ==="
+          sysctl -n hw.ncpu
+
+      - name: Patch ConfiguredModelProvider
+        working-directory: codex-source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="codex-rs/model-provider/src/provider.rs"
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: File not found: $FILE"
+            exit 1
+          fi
+
+          python3 - "$FILE" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          pattern = (
+              r'(impl\s+ModelProvider\s+for\s+ConfiguredModelProvider'
+              r'\s*\{.*?'
+              r'fn\s+capabilities\(&self\)\s*->\s*ProviderCapabilities'
+              r'\s*\{.*?'
+              r'ProviderCapabilities\s*\{)'
+              r'\s*remote_compaction,\s*'
+              r'\.\.ProviderCapabilities::default\(\),'
+          )
+
+          replacement = (
+              r'\1'
+              r'''
+              namespace_tools: false,
+              image_generation: false,
+              web_search: false,
+              external_web_access: false,
+              remote_compaction,
+              '''
+          )
+
+          new_text, count = re.subn(
+              pattern,
+              replacement,
+              text,
+              count=1,
+              flags=re.DOTALL,
+          )
+
+          if count != 1:
+              print("ERROR: ConfiguredModelProvider patch failed.")
+              print(f"Matches found: {count}")
+              sys.exit(1)
+
+          path.write_text(new_text)
+
+          print("SUCCESS: ConfiguredModelProvider patched.")
+          PY
+
+          echo
+          echo "=== Patched capabilities() ==="
+
+          sed -n \
+            '/impl ModelProvider for ConfiguredModelProvider/,/fn approval_review_preferred_model/p' \
+            "$FILE"
+
+      - name: Verify patch
         working-directory: codex-source
         shell: bash
         run: |
@@ -10,37 +128,108 @@
           from pathlib import Path
           import sys
 
-          path = Path(sys.argv[1])
-          text = path.read_text()
+          text = Path(sys.argv[1]).read_text()
 
-          old = """        ProviderCapabilities {
-            remote_compaction,
-            ..ProviderCapabilities::default()
-        }"""
+          start = text.find(
+              "impl ModelProvider for ConfiguredModelProvider"
+          )
 
-          new = """        ProviderCapabilities {
-            namespace_tools: false,
-            image_generation: false,
-            web_search: false,
-            external_web_access: false,
-            remote_compaction,
-        }"""
-
-          if old not in text:
+          if start == -1:
               raise SystemExit(
-                  "ERROR: Could not find ConfiguredModelProvider capabilities block."
+                  "ERROR: ConfiguredModelProvider not found."
               )
 
-          text = text.replace(old, new, 1)
+          end = text.find(
+              "#[cfg(test)]",
+              start,
+          )
 
-          path.write_text(text)
+          if end == -1:
+              end = len(text)
 
-          print("SUCCESS: ConfiguredModelProvider namespace_tools disabled.")
+          block = text[start:end]
+
+          required = [
+              "namespace_tools: false",
+              "image_generation: false",
+              "web_search: false",
+              "external_web_access: false",
+          ]
+
+          for item in required:
+              if item not in block:
+                  raise SystemExit(
+                      f"ERROR: Missing patched capability: {item}"
+                  )
+
+          print("SUCCESS: All Bedrock compatibility patches verified.")
           PY
 
-          echo
-          echo "=== Patched ConfiguredModelProvider ==="
+      - name: Build Codex
+        working-directory: codex-source/codex-rs
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          set -euo pipefail
 
-          grep -n -A10 -B3 \
-            "fn capabilities(&self) -> ProviderCapabilities" \
-            "$FILE"
+          cargo +1.95.0 build -p codex-cli --bin codex
+
+      - name: Verify Codex binary
+        working-directory: codex-source/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== File type ==="
+          file target/debug/codex
+
+          echo
+          echo "=== Architecture ==="
+          lipo -info target/debug/codex || true
+
+          echo
+          echo "=== Codex version ==="
+          ./target/debug/codex --version
+
+      - name: Package Codex
+        working-directory: codex-source/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ../../codex-artifact
+
+          cp target/debug/codex \
+            ../../codex-artifact/codex
+
+          chmod +x \
+            ../../codex-artifact/codex
+
+          cat > ../../codex-artifact/README.txt <<'EOF'
+          Custom Codex build for Intel macOS.
+
+          Source:
+          OpenAI Codex rust-v0.154.0
+
+          Rust:
+          1.95.0
+
+          AWS Bedrock Mantle compatibility:
+          namespace_tools = false
+          image_generation = false
+          web_search = false
+          external_web_access = false
+
+          Target:
+          macOS Intel x86_64
+
+          Model is configured separately in config.toml.
+          EOF
+
+      - name: Upload Codex artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-intel-macos
+          path: codex-artifact/
+          if-no-files-found: error
+          retention-days: 7
