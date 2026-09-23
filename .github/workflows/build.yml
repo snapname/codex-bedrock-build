@@ -70,41 +70,67 @@ jobs:
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          pattern = (
-              r'(impl\s+ModelProvider\s+for\s+ConfiguredModelProvider'
-              r'\s*\{.*?'
-              r'fn\s+capabilities\(&self\)\s*->\s*ProviderCapabilities'
-              r'\s*\{.*?'
-              r'ProviderCapabilities\s*\{)'
-              r'\s*remote_compaction,\s*'
-              r'\.\.ProviderCapabilities::default\(\),'
+          impl_start = text.find(
+              "impl ModelProvider for ConfiguredModelProvider"
           )
 
-          replacement = (
-              r'\1'
-              r'''
+          if impl_start == -1:
+              raise SystemExit(
+                  "ERROR: ConfiguredModelProvider implementation not found."
+              )
+
+          cap_start = text.find(
+              "fn capabilities(&self) -> ProviderCapabilities",
+              impl_start,
+          )
+
+          if cap_start == -1:
+              raise SystemExit(
+                  "ERROR: ConfiguredModelProvider capabilities() not found."
+              )
+
+          next_fn = text.find(
+              "fn approval_review_preferred_model",
+              cap_start,
+          )
+
+          if next_fn == -1:
+              raise SystemExit(
+                  "ERROR: Could not locate end of capabilities()."
+              )
+
+          block = text[cap_start:next_fn]
+
+          pattern = (
+              r"ProviderCapabilities\s*\{\s*"
+              r"remote_compaction,\s*"
+              r"\.\.ProviderCapabilities::default\(\),\s*"
+              r"\}"
+          )
+
+          replacement = """ProviderCapabilities {
               namespace_tools: false,
               image_generation: false,
               web_search: false,
               external_web_access: false,
               remote_compaction,
-              '''
-          )
+          }"""
 
-          new_text, count = re.subn(
+          new_block, count = re.subn(
               pattern,
               replacement,
-              text,
+              block,
               count=1,
-              flags=re.DOTALL,
           )
 
           if count != 1:
-              print("ERROR: ConfiguredModelProvider patch failed.")
-              print(f"Matches found: {count}")
+              print("ERROR: Could not patch capabilities().")
+              print("=== Current capabilities() ===")
+              print(block)
               sys.exit(1)
 
-          path.write_text(new_text)
+          text = text[:cap_start] + new_block + text[next_fn:]
+          path.write_text(text)
 
           print("SUCCESS: ConfiguredModelProvider patched.")
           PY
@@ -130,24 +156,26 @@ jobs:
 
           text = Path(sys.argv[1]).read_text()
 
-          start = text.find(
+          impl_start = text.find(
               "impl ModelProvider for ConfiguredModelProvider"
           )
 
-          if start == -1:
+          if impl_start == -1:
               raise SystemExit(
                   "ERROR: ConfiguredModelProvider not found."
               )
 
-          end = text.find(
-              "#[cfg(test)]",
-              start,
+          cap_start = text.find(
+              "fn capabilities(&self) -> ProviderCapabilities",
+              impl_start,
           )
 
-          if end == -1:
-              end = len(text)
+          next_fn = text.find(
+              "fn approval_review_preferred_model",
+              cap_start,
+          )
 
-          block = text[start:end]
+          block = text[cap_start:next_fn]
 
           required = [
               "namespace_tools: false",
@@ -159,10 +187,10 @@ jobs:
           for item in required:
               if item not in block:
                   raise SystemExit(
-                      f"ERROR: Missing patched capability: {item}"
+                      f"ERROR: Missing: {item}"
                   )
 
-          print("SUCCESS: All Bedrock compatibility patches verified.")
+          print("SUCCESS: All capabilities verified.")
           PY
 
       - name: Build Codex
@@ -222,8 +250,6 @@ jobs:
 
           Target:
           macOS Intel x86_64
-
-          Model is configured separately in config.toml.
           EOF
 
       - name: Upload Codex artifact
