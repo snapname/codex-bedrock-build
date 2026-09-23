@@ -49,7 +49,11 @@ jobs:
           echo "=== CPU ==="
           sysctl -n hw.ncpu
 
-      - name: Patch ConfiguredModelProvider
+          echo
+          echo "=== Memory ==="
+          sysctl -n hw.memsize
+
+      - name: Patch Bedrock namespace tools
         working-directory: codex-source
         shell: bash
         run: |
@@ -62,87 +66,54 @@ jobs:
             exit 1
           fi
 
+          echo "=== Before patch ==="
+          sed -n '316,335p' "$FILE"
+
           python3 - "$FILE" <<'PY'
           from pathlib import Path
-          import re
           import sys
 
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          impl_start = text.find(
-              "impl ModelProvider for ConfiguredModelProvider"
-          )
+          old = """        ProviderCapabilities {
+            remote_compaction,
+            ..ProviderCapabilities::default()
+        }"""
 
-          if impl_start == -1:
-              raise SystemExit(
-                  "ERROR: ConfiguredModelProvider implementation not found."
+          new = """        ProviderCapabilities {
+            namespace_tools: false,
+            remote_compaction,
+            ..ProviderCapabilities::default()
+        }"""
+
+          if old not in text:
+              print("ERROR: Target ProviderCapabilities block not found.")
+              print()
+              print("Actual source around ConfiguredModelProvider:")
+              start = text.find(
+                  "impl ModelProvider for ConfiguredModelProvider"
               )
+              if start == -1:
+                  raise SystemExit(
+                      "ERROR: ConfiguredModelProvider not found."
+                  )
 
-          cap_start = text.find(
-              "fn capabilities(&self) -> ProviderCapabilities",
-              impl_start,
-          )
-
-          if cap_start == -1:
-              raise SystemExit(
-                  "ERROR: ConfiguredModelProvider capabilities() not found."
-              )
-
-          next_fn = text.find(
-              "fn approval_review_preferred_model",
-              cap_start,
-          )
-
-          if next_fn == -1:
-              raise SystemExit(
-                  "ERROR: Could not locate end of capabilities()."
-              )
-
-          block = text[cap_start:next_fn]
-
-          pattern = (
-              r"ProviderCapabilities\s*\{\s*"
-              r"remote_compaction,\s*"
-              r"\.\.ProviderCapabilities::default\(\),\s*"
-              r"\}"
-          )
-
-          replacement = """ProviderCapabilities {
-              namespace_tools: false,
-              image_generation: false,
-              web_search: false,
-              external_web_access: false,
-              remote_compaction,
-          }"""
-
-          new_block, count = re.subn(
-              pattern,
-              replacement,
-              block,
-              count=1,
-          )
-
-          if count != 1:
-              print("ERROR: Could not patch capabilities().")
-              print("=== Current capabilities() ===")
-              print(block)
+              print(text[start:start + 1200])
               sys.exit(1)
 
-          text = text[:cap_start] + new_block + text[next_fn:]
+          text = text.replace(old, new, 1)
           path.write_text(text)
 
-          print("SUCCESS: ConfiguredModelProvider patched.")
+          print()
+          print("SUCCESS: namespace_tools = false")
           PY
 
           echo
-          echo "=== Patched capabilities() ==="
+          echo "=== After patch ==="
+          sed -n '316,337p' "$FILE"
 
-          sed -n \
-            '/impl ModelProvider for ConfiguredModelProvider/,/fn approval_review_preferred_model/p' \
-            "$FILE"
-
-      - name: Verify patch
+      - name: Verify Bedrock patch
         working-directory: codex-source
         shell: bash
         run: |
@@ -156,41 +127,44 @@ jobs:
 
           text = Path(sys.argv[1]).read_text()
 
-          impl_start = text.find(
+          provider_start = text.find(
               "impl ModelProvider for ConfiguredModelProvider"
           )
 
-          if impl_start == -1:
+          if provider_start == -1:
               raise SystemExit(
                   "ERROR: ConfiguredModelProvider not found."
               )
 
-          cap_start = text.find(
+          capabilities_start = text.find(
               "fn capabilities(&self) -> ProviderCapabilities",
-              impl_start,
+              provider_start,
           )
+
+          if capabilities_start == -1:
+              raise SystemExit(
+                  "ERROR: capabilities() not found."
+              )
 
           next_fn = text.find(
               "fn approval_review_preferred_model",
-              cap_start,
+              capabilities_start,
           )
 
-          block = text[cap_start:next_fn]
+          if next_fn == -1:
+              raise SystemExit(
+                  "ERROR: End of capabilities() not found."
+              )
 
-          required = [
-              "namespace_tools: false",
-              "image_generation: false",
-              "web_search: false",
-              "external_web_access: false",
-          ]
+          block = text[capabilities_start:next_fn]
 
-          for item in required:
-              if item not in block:
-                  raise SystemExit(
-                      f"ERROR: Missing: {item}"
-                  )
+          if "namespace_tools: false" not in block:
+              print(block)
+              raise SystemExit(
+                  "ERROR: namespace_tools was not patched."
+              )
 
-          print("SUCCESS: All capabilities verified.")
+          print("SUCCESS: Bedrock namespace patch verified.")
           PY
 
       - name: Build Codex
@@ -242,14 +216,13 @@ jobs:
           Rust:
           1.95.0
 
-          AWS Bedrock Mantle compatibility:
+          Bedrock Mantle compatibility:
           namespace_tools = false
-          image_generation = false
-          web_search = false
-          external_web_access = false
 
           Target:
           macOS Intel x86_64
+
+          Model is configured separately in config.toml.
           EOF
 
       - name: Upload Codex artifact
