@@ -1,0 +1,200 @@
+name: Build Codex for Intel macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Codex x86_64 macOS
+    runs-on: macos-15-intel
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Checkout our repository
+      # ------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # 2. Checkout official OpenAI Codex source
+      # ------------------------------------------------------------
+      - name: Clone OpenAI Codex
+        run: |
+          git clone --depth 1 --branch rust-v0.154.0 \
+            https://github.com/openai/codex.git \
+            codex-source
+
+      # ------------------------------------------------------------
+      # 3. Install Rust
+      # ------------------------------------------------------------
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      # ------------------------------------------------------------
+      # 4. Show build environment
+      # ------------------------------------------------------------
+      - name: Show environment
+        run: |
+          echo "=== System ==="
+          sw_vers
+
+          echo "=== Architecture ==="
+          uname -m
+
+          echo "=== Rust ==="
+          rustc --version
+          cargo --version
+
+          echo "=== CPU ==="
+          sysctl -n hw.ncpu
+
+          echo "=== Memory ==="
+          sysctl -n hw.memsize
+
+      # ------------------------------------------------------------
+      # 5. Apply Bedrock namespace compatibility patch
+      #
+      # Bedrock Mantle does not accept:
+      #
+      #   {"type":"namespace", ...}
+      #
+      # It accepts function / mcp.
+      #
+      # The Codex Bedrock issue documents this exact problem.
+      # ------------------------------------------------------------
+      - name: Patch Bedrock namespace tools
+        working-directory: codex-source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="codex-rs/model-provider/src/amazon_bedrock/mod.rs"
+
+          echo "Checking:"
+          echo "$FILE"
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: Bedrock provider source file not found."
+            exit 1
+          fi
+
+          echo
+          echo "Before patch:"
+          grep -n -A10 -B5 "fn capabilities" "$FILE" || true
+
+          python3 - "$FILE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          old = "namespace_tools: true,"
+          new = "namespace_tools: false,"
+
+          count = text.count(old)
+
+          if count == 0:
+              print("ERROR: namespace_tools: true was not found.")
+              sys.exit(1)
+
+          if count > 1:
+              print(f"ERROR: Found {count} occurrences.")
+              print("Refusing to modify automatically.")
+              sys.exit(1)
+
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+
+          print("Patch applied successfully.")
+          PY
+
+          echo
+          echo "After patch:"
+          grep -n -A10 -B5 "fn capabilities" "$FILE" || true
+
+          echo
+          echo "Confirmed:"
+          grep -n "namespace_tools:" "$FILE"
+
+      # ------------------------------------------------------------
+      # 6. Build Codex
+      # ------------------------------------------------------------
+      - name: Build Codex
+        working-directory: codex-source/codex-rs
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          cargo build --locked -p codex-cli --bin codex
+
+      # ------------------------------------------------------------
+      # 7. Verify the resulting binary
+      # ------------------------------------------------------------
+      - name: Verify Codex binary
+        working-directory: codex-source/codex-rs
+        run: |
+          set -e
+
+          echo "=== File type ==="
+          file target/debug/codex
+
+          echo
+          echo "=== Architecture ==="
+          lipo -info target/debug/codex || true
+
+          echo
+          echo "=== Codex version ==="
+          ./target/debug/codex --version
+
+      # ------------------------------------------------------------
+      # 8. Package artifact
+      # ------------------------------------------------------------
+      - name: Package Codex
+        working-directory: codex-source/codex-rs
+        run: |
+          set -e
+
+          mkdir -p ../../codex-artifact
+
+          cp target/debug/codex \
+            ../../codex-artifact/codex
+
+          chmod +x \
+            ../../codex-artifact/codex
+
+          cat > ../../codex-artifact/README.txt <<'EOF'
+          Custom Codex build for Intel macOS.
+
+          Purpose:
+          - AWS Bedrock Mantle compatibility
+          - namespace_tools disabled for Bedrock
+          - Built from OpenAI Codex rust-v0.154.0
+
+          Target:
+          - macOS Intel x86_64
+
+          Model is NOT embedded in this binary.
+
+          Configure the model separately in Codex config.toml.
+          Example:
+
+          model = "openai.gpt-6-astra"
+          model_provider = "bedrock"
+          EOF
+
+      # ------------------------------------------------------------
+      # 9. Upload the compiled binary
+      # ------------------------------------------------------------
+      - name: Upload Codex artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-intel-macos
+          path: codex-artifact/
+          if-no-files-found: error
+          retention-days: 7
